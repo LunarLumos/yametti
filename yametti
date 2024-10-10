@@ -1,0 +1,197 @@
+#!/bin/bash
+
+# Define colors
+RESET="\033[0m"
+RED="\033[1;31m"
+GREEN="\033[1;32m"
+YELLOW="\033[1;33m"
+BLUE="\033[1;34m"
+MAGENTA="\033[1;35m"
+CYAN="\033[1;36m"
+WHITE="\033[1;37m"
+BOLD="\033[1m"
+BRIGHT_CYAN="\033[1;36m"
+BRIGHT_MAGENTA="\033[1;35m"
+BLINK="\033[5m"
+UNDERLINE="\033[4m"
+
+
+
+# Display a banner
+banner() {
+    echo -e "${BRIGHT_CYAN}
+╦ ╦╔═╗╔╦╗╔═╗╔╦╗╔╦╗┬
+╚╦╝╠═╣║║║║╣  ║  ║ │
+ ╩ ╩ ╩╩ ╩╚═╝ ╩  ╩ o
+
+       
+${RESET}"
+echo -e "${BOLD}${BRIGHT_MAGENTA}       Created by ${BLINK}${UNDERLINE}${YELLOW}Lunar Lumos${RESET}\n"
+
+}
+
+# Parse command line arguments
+while getopts "d:w:r:h" opt; do
+    case $opt in
+        d) dom="$OPTARG" ;;
+        w) wordlist="$OPTARG" ;;
+        r) resolvers="$OPTARG" ;;
+        h) 
+            banner
+            echo -e "${GREEN}Usage: $0 -d domain -w wordlist -r resolvers${RESET}"
+            echo -e "${GREEN}Options:${RESET}"
+            echo -e "${GREEN}  -d    Domain to enumerate (required)${RESET}"
+            echo -e "${GREEN}  -w    Wordlist for subdomain guessing (required)${RESET}"
+            echo -e "${GREEN}  -r    Resolvers file (required)${RESET}"
+            echo -e "${GREEN}  -h    Display this help message${RESET}"
+            exit 0 ;;
+        *) echo "Usage: $0 -d domain -w wordlist -r resolvers"; exit 1 ;;
+    esac
+done
+
+if [ -z "$dom" ] || [ -z "$wordlist" ] || [ -z "$resolvers" ]; then
+    echo -e "${RED}[-] Missing required arguments!${RESET}"
+    echo "Usage: $0 -d domain -w wordlist -r resolvers"
+    exit 1
+fi
+
+domm=$(echo "$dom" | cut -d '.' -f 1)
+
+# Passive collection function
+passive() {
+    echo -e "${GREEN}[+] Collecting subdomains passively...${RESET}"
+    > temp.txt  # Clear temp.txt
+
+    echo -e "${YELLOW}[*] Scanning Subdomains with Nmap...${RESET}"
+    nmap --script hostmap-crtsh.nse "$dom" | grep -o -E "([a-zA-Z0-9._-]+)\.$dom" | sort -u >> temp.txt || echo -e "${RED}[-] Nmap scan failed!${RESET}"
+
+    echo -e "${YELLOW}[*] Querying Certspotter...${RESET}"
+    curl -s "https://api.certspotter.com/v1/issuances?domain=$dom&include_subdomains=true&expand=dns_names" | jq -r .[].dns_names | grep -o -E "([a-zA-Z0-9._-]+)\.$dom" | sort -u >> temp.txt || echo -e "${RED}[-] Certspotter query failed!${RESET}"
+
+    echo -e "${YELLOW}[*] Fetching from JLDC...${RESET}"
+    curl -s "https://jldc.me/anubis/subdomains/$dom" | grep -Po "((http|https):\/\/)?([a-zA-Z0-9._-]+)\.$dom" | sort -u >> temp.txt || echo -e "${RED}[-] JLDC fetch failed!${RESET}"
+
+    echo -e "${YELLOW}[*] Querying crt.sh...${RESET}"
+    curl -s "https://crt.sh/?q=%25.${dom}&output=json" | jq -r '.[].name_value' | sed 's/\*\.//g' | sort -u >> temp.txt || echo -e "${RED}[-] crt.sh query failed!${RESET}"
+
+    echo -e "${YELLOW}[*] Fetching from Aanubis...${RESET}"
+    curl -s "https://jldc.me/anubis/subdomains/$dom" | jq -r '.' | grep -o "\w.*\.$dom" | sort -u >> temp.txt || echo -e "${RED}[-] Aanubis fetch failed!${RESET}"
+
+    echo -e "${YELLOW}[*] Querying HackerTarget...${RESET}"
+    curl -s "https://api.hackertarget.com/hostsearch/?q=$dom" | grep -oE '\S+\.'"$dom" | sort -u >> temp.txt || echo -e "${RED}[-] HackerTarget query failed!${RESET}"
+
+    echo -e "${YELLOW}[*] Fetching from AlienVault...${RESET}"
+    for page in {1..4}; do
+        curl -s "https://otx.alienvault.com/api/v1/indicators/domain/$dom/url_list?limit=10000000&page=$page" | grep -o '"hostname": *"[^"]*' | sed 's/"hostname": "//' | sort -u >> temp.txt || echo -e "${RED}[-] AlienVault fetch failed!${RESET}"
+    done
+
+    echo -e "${YELLOW}[*] Fetching from Subdomain Center...${RESET}"
+    curl -s "https://api.subdomain.center/?domain=$dom" | jq -r '.[]' | sort -u >> temp.txt || echo -e "${RED}[-] Subdomain Center fetch failed!${RESET}"
+
+    echo -e "${YELLOW}[*] Querying RapidDNS...${RESET}"
+    total_pages=$(curl --silent --insecure "https://rapiddns.io/subdomain/$dom?page=1" | grep -oP 'href="/subdomain/'"$dom"'\?page=\K[0-9]+' | sort -nu | tail -1)
+    for page in $(seq 1 "$total_pages"); do
+        curl --silent --insecure "https://rapiddns.io/subdomain/$dom?page=$page" | grep -Po "((http|https):\/\/)?([a-zA-Z0-9._-]+)\.$dom" >> temp.txt || echo -e "${RED}[-] RapidDNS fetch failed!${RESET}"
+    done
+
+    echo -e "${YELLOW}[*] Querying crt.sh for additional results...${RESET}"
+    curl --silent --insecure "https://crt.sh/?q=%.$dom&group=none" | grep -o -E "[a-zA-Z0-9._-]+\.$dom" | sort -u >> temp.txt || echo -e "${RED}[-] Additional crt.sh query failed!${RESET}"
+    curl --silent --insecure "https://crt.sh/?q=%.%.$dom" | grep -oP "\<TD\>\K.*\.$dom" | sed -e 's/\<BR\>/\n/g' -e 's/[\<|\>]//g' | grep -o -E "[a-zA-Z0-9._-]+\.$dom" | sort -u >> temp.txt || echo -e "${RED}[-] Additional crt.sh fetch failed!${RESET}"
+
+    echo -e "${YELLOW}[*] Querying HackerTarget again...${RESET}"
+    curl --silent --insecure "https://api.hackertarget.com/hostsearch/?q=$dom" | grep -o -E "[a-zA-Z0-9._-]+\.$dom" | sort -u >> temp.txt || echo -e "${RED}[-] Second HackerTarget query failed!${RESET}"
+
+    echo -e "${YELLOW}[*] Querying URLScan...${RESET}"
+    curl --silent --insecure "https://urlscan.io/api/v1/search/?q=$dom" | grep -o -E "[a-zA-Z0-9._-]+\.$dom" | sort -u >> temp.txt || echo -e "${RED}[-] URLScan query failed!${RESET}"
+
+    echo -e "${YELLOW}[*] Querying CertificateDetails...${RESET}"
+    curl --silent --insecure "https://certificatedetails.com/$dom" | grep -o -E "[a-zA-Z0-9._-]+\.${dom}" | sort -u >> temp.txt || echo -e "${RED}[-] CertificateDetails query failed!${RESET}"
+
+    echo -e "${YELLOW}[*] Running Fierce...${RESET}"
+    fierce --domain "$dom" | grep -o -E "[a-zA-Z0-9._-]+\.$dom" | sort -u >> temp.txt || echo -e "${RED}[-] Fierce run failed!${RESET}"
+
+    echo -e "${YELLOW}[*] Running Subfinder...${RESET}"
+    subfinder -d "$dom" | grep -o -E "[a-zA-Z0-9._-]+\.$dom" | sort -u >> temp.txt || echo -e "${RED}[-] Subfinder run failed!${RESET}"
+
+    echo -e "${YELLOW}[*] Running Sublist3r...${RESET}"
+    sublist3r -d "$dom" -n | grep -o -E "[a-zA-Z0-9._-]+\.$dom" | sort -u >> temp.txt || echo -e "${RED}[-] Sublist3r run failed!${RESET}"
+
+    echo -e "${YELLOW}[*] Running Assetfinder...${RESET}"
+    assetfinder --subs-only "$dom" | sort -u >> asset.txt || echo -e "${RED}[-] Assetfinder run failed!${RESET}"
+
+    echo -e "${YELLOW}[*] Running Findomain...${RESET}"
+    findomain -t "$dom" | grep -o -E "[a-zA-Z0-9._-]+\.$dom" | sort -u >> temp.txt || echo -e "${RED}[-] Findomain run failed!${RESET}"
+
+    echo -e "${YELLOW}[*] Running Amass...${RESET}"
+    amass enum -passive -d "$dom" | grep -o -E "[a-zA-Z0-9._-]+\.$dom" | sort -u >> temp.txt || echo -e "${RED}[-] Amass run failed!${RESET}"
+
+    cat asset.txt | grep "*" | sed 's/\*\.\(.*\)/\1/' >> asset1.txt
+    cat asset.txt >> temp.txt
+
+    echo -e "${GREEN}[+] Passive collection complete!${RESET}"
+}
+
+# Active collection function
+active() {
+    echo -e "${GREEN}[+] Starting active subdomain enumeration...${RESET}"
+
+    > temp1.txt  # Clear temp1.txt
+    for sub in $(cat "$wordlist"); do
+        for ass in $(cat "asset1.txt"); do
+            echo "$sub.$ass" >> temp1.txt
+            echo "$sub.$sub.$ass" >> temp1.txt
+        done
+        echo "$sub.$dom" >> temp1.txt
+        echo "$sub.$sub.$dom" >> temp1.txt
+        echo "$sub.$sub.$sub.$dom" >> temp1.txt
+    done
+
+    puredns resolve temp1.txt --resolvers "$resolvers" --write-wildcards wild1.txt | \
+        grep -Eo '([a-zA-Z0-9\-]+\.[a-zA-Z0-9\-]+\.[a-zA-Z]{2,})' | \
+        grep "$domm" >> ftemp.txt
+
+    # Wildcard checks
+    for i in {1..3}; do
+        if [ -s "wild$i.txt" ]; then
+            for sub in $(cat "$wordlist"); do
+                for w1 in $(cat "wild$i.txt"); do
+                    echo "$sub.$w1" >> "temp$i.txt"
+                done
+            done
+            puredns resolve "temp$i.txt" --resolvers "$resolvers" --write-wildcards "wild$((i+1)).txt" | \
+                grep -Eo '([a-zA-Z0-9\-]+\.[a-zA-Z0-9\-]+\.[a-zA-Z]{2,})' | \
+                grep "$domm" >> ftemp.txt
+        else
+            echo "[+] No wildcards detected."
+            break
+        fi
+    done
+
+    echo -e "${GREEN}[+] Active collection complete!${RESET}"
+}
+
+# Main execution
+main() {
+    banner
+    rm -f temp.txt temp1.txt temp2.txt temp3.txt ftemp.txt wild1.txt wild2.txt wild3.txt asset.txt asset1.txt
+    passive 
+    active
+
+    cat ftemp.txt | grep -Eo '([a-zA-Z0-9\-]+\.[a-zA-Z0-9\-]+\.[a-zA-Z]{2,})' | \
+        grep "$domm" | sort -u | tee -a "$dom.subdomains.txt"
+
+    # Count and print the number of collected subdomains
+    count=$(sort -u "$dom.subdomains.txt" | wc -l)
+    echo -e "${GREEN}[+] Total subdomains collected: $count${RESET}"
+
+    # Print the output location
+    echo -e "${GREEN}[+] Subdomains collected and saved to $dom.subdomains.txt.${RESET}"
+
+    # Thank the user
+    echo -e "${GREEN}[+] Thank you for using the yametti Tool!${RESET}"
+
+    # Clean up temporary files
+    rm -f temp.txt temp1.txt temp2.txt temp3.txt ftemp.txt wild1.txt wild2.txt wild3.txt asset.txt asset1.txt
+}
+
+main
